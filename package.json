@@ -1,0 +1,8 @@
+{
+  "name": "aegis-watcher",
+  "version": "1.0.0",
+  "private": true,
+  "main": "watcher.js",
+  "scripts": { "start": "node watcher.js", "once": "RUN_ONCE=1 node watcher.js", "dry": "RUN_ONCE=1 DRY_RUN=1 node watcher.js" },
+  "dependencies": { "ethers": "^6.13.4", "dotenv": "^16.4.5" }
+}
