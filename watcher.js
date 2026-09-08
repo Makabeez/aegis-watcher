@@ -42,6 +42,7 @@ const ABI = [
 ];
 
 const UA = { "User-Agent": "Aegis-Watcher/1.0", Accept: "application/json" };
+const INTERNAL_KEY = process.env.AEGIS_INTERNAL_KEY || "";
 const log = (...a) => console.log(new Date().toISOString(), ...a);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -72,9 +73,16 @@ async function listVerified(pages) {
 }
 
 async function analyze(address) {
-  const d = await getJson(`${CFG.analyzeUrl}?address=${address}`);
-  if (!d.ok) throw new Error(d.error || "analyze failed");
-  return d;
+  const headers = INTERNAL_KEY ? { ...UA, "x-aegis-key": INTERNAL_KEY } : UA;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const r = await fetch(`${CFG.analyzeUrl}?address=${address}`, { headers });
+    if (r.status === 429) { await sleep(8000 * (attempt + 1)); continue; }   // backoff on rate limit
+    if (!r.ok) throw new Error(`${r.status}`);
+    const d = await r.json();
+    if (!d.ok) throw new Error(d.error || "analyze failed");
+    return d;
+  }
+  throw new Error("rate limited after retries");
 }
 
 async function cycle(provider, wallet, registry) {
@@ -93,9 +101,16 @@ async function cycle(provider, wallet, registry) {
   const fresh = [];
   for (const c of candidates) {
     if (fresh.length >= CFG.maxPerRun) break;
-    try {
-      if (!(await registry.hasAttestation(c.address))) fresh.push(c);
-    } catch (e) { log("  hasAttestation error", c.address, e.message); }
+    let ok = false;
+    for (let a = 0; a < 3 && !ok; a++) {
+      try {
+        if (!(await registry.hasAttestation(c.address))) fresh.push(c);
+        ok = true;
+      } catch (e) {
+        if (a === 2) log(`  hasAttestation failed (${c.address}): RPC error, skipping this cycle`);
+        else await sleep(800 * (a + 1));
+      }
+    }
   }
   log(`${fresh.length} not yet attested`);
   if (!fresh.length) return log("nothing to do");
