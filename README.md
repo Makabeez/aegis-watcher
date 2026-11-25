@@ -6,7 +6,7 @@ number you increment by hand into a KPI that grows on its own.
 
 - Analysis is delegated to the live `/api/analyze` endpoint → one engine, and
   **no Anthropic key on this box**.
-- Dedupe is on-chain via `hasAttestation()` → stateless, safe to restart.
+- Dedupe by bytecode: identical code reuses its verdict (`bytecode-cache.json`, see v1.2), and every address is still attested on-chain.
 - Writes are batched via `attestBatch()` → ~1 tx per 10 contracts.
 
 ---
@@ -132,3 +132,60 @@ timestamp,totalAttestations,scannedThisCycle,degradedThisCycle
 
 That file is your growth chart for the December Finalist review. **Back it up off
 this machine** — it cannot be reconstructed later.
+
+## v1.2 — bytecode dedupe
+
+Identical bytecode gets an identical verdict. Before calling the AI, the watcher
+hashes the deployed code and reuses any previous verdict for that hash
+(`bytecode-cache.json`).
+
+Why it matters: GIWA Sepolia has tens of thousands of verified contracts, most of them
+byte-identical template deploys (`HelloGIWA`, `StandardERC20`, `StandardNFT`).
+Auditing each one separately costs ~$0.0056 a scan for the same answer. Dedupe
+cuts spend by roughly 90% and makes duplicates deterministic — which also removes
+the "same contract, different score" inconsistency for templates.
+
+Cached rows log as `[bytecode-match]` and are still attested on-chain per address,
+so coverage keeps growing.
+
+## v1.3 — coverage denominator
+
+Once a day the watcher pages the explorer to count total verified contracts and
+logs `coverage: N/M verified contracts (X%)`. `kpi.csv` gains a fifth column:
+
+```
+timestamp,totalAttestations,scannedThisCycle,degraded,verifiedTotal
+```
+
+`verifiedTotal` is blank on cycles that skip the count. Coverage % is the number
+worth quoting — it implies completeness, where a raw count only implies activity.
+
+## v1.4 — honest coverage + nonce safety
+
+**Coverage counting.** The old count silently capped at 3,000 and reported it as
+fact — GIWA Sepolia actually has 20,000+ verified contracts, so real coverage was
+being overstated by ~7x. It now pages until exhausted and returns a completeness
+flag. Incomplete counts are recorded as `>=N` and logged as an upper bound, never
+as a clean percentage. It runs **weekly**, not daily — the count is ~400 requests.
+
+Never quote a coverage % from a `>=` row. Quote the absolute attestation count.
+
+**Nonce handling.** Writes go through ethers' `NonceManager` (local nonce tracking), the nonce is reset after a failed batch, and
+a failed batch waits 6s so an in-flight tx can settle. This fixes the
+`nonce has already been used` / `replacement fee too low` errors that were losing
+~1 batch (20 contracts) per cycle.
+
+## v1.5 — schema v4, accuracy audit, on-demand scoring (Nov 2026)
+
+- **Schema v4.** Scores are written with `schemaVersion 4`. The bytecode check now stops before the
+  Solidity CBOR metadata trailer, whose IPFS hash was being read as fake `DELEGATECALL` / `SELFDESTRUCT`
+  opcodes. 1,782 historical scores were corrected on-chain with `rescore.js` (a correction may only lower
+  a score). Full write-up: the Accuracy section of the
+  [aegis-giwa README](https://github.com/Makabeez/aegis-giwa#accuracy--what-we-found-and-fixed).
+- **`attest-one.js`** scores specific addresses on demand, for contracts verified before the watcher's
+  window. Dry run by default; `--send` writes one `attestBatch`. It refuses to write a degraded scan.
+- **RPC note.** Use an RPC that answers `eth_maxPriorityFeePerGas`. Through a provider that didn't,
+  ethers fell back to a 1 gwei priority fee (about 1,000× GIWA's normal 0.001 gwei) and drained the
+  attester within hours; the `MIN_BALANCE_ETH` guard then paused writes until it was topped up.
+- **Stale watch.** `stale-watch.sh` restarts the watcher and sends an alert if `kpi.csv` stops growing
+  for 6 hours.

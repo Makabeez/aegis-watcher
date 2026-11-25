@@ -15,6 +15,19 @@ const CAT_TO_FLAG = {
   "reentrancy": 1, "access-control": 2, "dangerous-approval": 4,
   "honeypot-rug": 8, "oracle-manipulation": 16, "unsafe-upgrade": 32,
 };
+// Deterministic scoring: the model reports FINDINGS, code computes the SCORE.
+// Same findings => same score, every time. No free-form number from the LLM.
+const SEV_WEIGHT = { low: 2, medium: 8, high: 20, critical: 45 };
+const BASE_SCORE = 6;
+// Dominant finding sets the tone; additional findings add at a discount, so a
+// contract with many minor notes never outranks one with a real vulnerability.
+function scoreFromFindings(findings) {
+  const w = findings.map((f) => SEV_WEIGHT[f.severity] || 0).sort((a, b) => b - a);
+  if (!w.length) return BASE_SCORE;
+  const rest = w.slice(1).reduce((a, b) => a + b, 0);
+  return Math.max(0, Math.min(100, Math.round(BASE_SCORE + w[0] + 0.35 * rest)));
+}
+
 const FLAG_NAMES = [
   [1, "Reentrancy"], [2, "Access control"], [4, "Dangerous approval"],
   [8, "Honeypot / rug"], [16, "Oracle manipulation"], [32, "Unsafe upgrade"],
@@ -98,13 +111,12 @@ async function fetchContract(addr) {
 // ---- Claude source audit ----
 const SYSTEM = `You are a senior smart-contract security auditor. Analyze the provided Solidity source for risks to users who interact with it.
 Respond with ONLY a JSON object — no prose, no markdown fences — with exactly this shape:
-{"score": <integer 0-100 overall risk, 0 = safe, 100 = certain exploit or rug>,
- "summary": "<1-2 plain-English sentences a non-technical user understands>",
+{"summary": "<1-2 plain-English sentences a non-technical user understands>",
  "findings": [{"category": "<reentrancy|access-control|dangerous-approval|honeypot-rug|oracle-manipulation|unsafe-upgrade|other>",
                "severity": "<low|medium|high|critical>",
                "title": "<short title naming the function or pattern>",
                "explanation": "<1-2 sentences, plain English, why it matters to a user>"}]}
-Rules: report only real, evidenced issues present in the code and name the function/pattern. Do not invent issues. If the contract is clean, return an empty findings array and a low score. Be calibrated: standard safe patterns (OpenZeppelin Ownable/ERC20/ERC721) are not findings by themselves. Owner-only mint, blacklist, fee changes, or pause that can harm holders IS honeypot-rug risk. Approvals to arbitrary or unbounded addresses are dangerous-approval. Proxy/delegatecall/upgradeable logic is unsafe-upgrade unless clearly access-controlled and timelocked. Missing or weak permission checks on state-changing functions are access-control.`;
+Do NOT output a numeric score — severity per finding is what matters, and the score is computed from it.\nRules: report only real, evidenced issues present in the code and name the function/pattern. Do not invent issues. If the contract is clean, return an empty findings array and a low score. Be calibrated: standard safe patterns (OpenZeppelin Ownable/ERC20/ERC721) are not findings by themselves. Owner-only mint, blacklist, fee changes, or pause that can harm holders IS honeypot-rug risk. Approvals to arbitrary or unbounded addresses are dangerous-approval. Proxy/delegatecall/upgradeable logic is unsafe-upgrade unless clearly access-controlled and timelocked. Missing or weak permission checks on state-changing functions are access-control.`;
 
 async function aiAudit(name, source) {
   const key = process.env.ANTHROPIC_API_KEY;
@@ -134,7 +146,7 @@ async function aiAudit(name, source) {
     source: "ai",
   }));
   let flags = 0; for (const f of findings) flags |= (CAT_TO_FLAG[f.category] || 0);
-  const score = Math.max(0, Math.min(100, Math.round(Number(parsed.score) || 0)));
+  const score = scoreFromFindings(findings);
   return { score, flags, findings, summary: String(parsed.summary || "").slice(0, 400), truncated, model: MODEL, usage: d.usage || null };
 }
 
@@ -174,8 +186,9 @@ module.exports = async (req, res) => {
     }
 
     const flags = h.flags | (ai ? ai.flags : 0);
-    const score = ai ? Math.max(ai.score, h.score) : h.score;   // conservative: higher risk wins
-    const findings = [...(ai ? ai.findings : []), ...h.findings];
+    const allFindings = [...(ai ? ai.findings : []), ...h.findings];
+    const score = ai ? scoreFromFindings(allFindings) : h.score;  // deterministic: f(findings)
+    const findings = allFindings;
     const summary = ai ? ai.summary
       : (findings.length ? `Bytecode analysis found ${findings.length} signal(s). ${c.verified ? "" : "Source is unverified, so logic-level risks could not be assessed."}`.trim()
                          : "No high-risk patterns detected in bytecode.");
@@ -186,6 +199,7 @@ module.exports = async (req, res) => {
       engine: ai ? "ai+static" : "static", model: ai ? ai.model : null,
       score, flags, flagList: FLAG_NAMES.filter(([b]) => flags & b).map(([, n]) => n),
       findings, summary, truncated: ai ? ai.truncated : false, aiError, report, bytecodeSize: h.size,
+      scoring: { base: BASE_SCORE, weights: SEV_WEIGHT, note: "score = base + top severity + 0.35 x remaining severities, capped 0-100" },
     };
     cache.set(key, { t: Date.now(), result });
     return res.status(200).end(JSON.stringify(result));

@@ -43,6 +43,33 @@ const ABI = [
 
 const UA = { "User-Agent": "Aegis-Watcher/1.0", Accept: "application/json" };
 const INTERNAL_KEY = process.env.AEGIS_INTERNAL_KEY || "";
+const fs = require("fs");
+const CACHE_FILE = __dirname + "/bytecode-cache.json";
+let codeCache = {};
+try { codeCache = JSON.parse(fs.readFileSync(CACHE_FILE, "utf8")); } catch (_) {}
+const COVERAGE_FILE = __dirname + "/.coverage-day";
+async function countVerified() {
+  // Pages until exhausted. GIWA Sepolia has tens of thousands of verified
+  // contracts, so this is slow — run it weekly, not per cycle. Returns a
+  // completeness flag so a page cap is never reported as if it were the truth.
+  const MAX_PAGES = 1200;                 // 60k contracts
+  let total = 0, params = null, pages = 0;
+  while (pages < MAX_PAGES) {
+    const qs = params ? "?" + new URLSearchParams(params).toString() : "";
+    let d;
+    try { d = await getJson(`${CFG.explorer}/api/v2/smart-contracts${qs}`); }
+    catch (e) { return { total, complete: false, error: e.message }; }
+    const n = (d.items || []).length;
+    total += n; pages++;
+    params = d.next_page_params;
+    if (!params || !n) return { total, complete: true };
+    await sleep(120);
+  }
+  return { total, complete: false };
+}
+
+const saveCache = () => { try { fs.writeFileSync(CACHE_FILE, JSON.stringify(codeCache)); } catch (_) {} };
+
 const log = (...a) => console.log(new Date().toISOString(), ...a);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -120,6 +147,21 @@ async function cycle(provider, wallet, registry) {
   let degraded = 0;
   for (const c of fresh) {
     try {
+      // identical bytecode => identical verdict. Saves AI spend and makes
+      // duplicate template contracts deterministic.
+      let code = null;
+      for (let a = 0; a < 4 && code === null; a++) {
+        try { code = await provider.getCode(c.address); }
+        catch (err) { if (a === 3) throw err; await sleep(1500 * (a + 1)); }
+      }
+      const codeHash = ethers.keccak256(code);
+      const cached = codeCache[codeHash];
+      if (cached) {
+        rows.push({ address: c.address, score: cached.score, flags: cached.flags,
+                    hash: cached.hash, engine: "cached", name: c.name });
+        log(`  cached  ${c.address} ${c.name} -> ${cached.score}/100 flags=${cached.flags} [bytecode-match]`);
+        continue;
+      }
       const r = await analyze(c.address);
       rows.push({
         address: c.address,
@@ -130,6 +172,11 @@ async function cycle(provider, wallet, registry) {
         name: r.name || c.name,
       });
       log(`  scanned ${c.address} ${r.name || c.name} -> ${r.score}/100 flags=${r.flags} [${r.engine}]`);
+      if (r.engine === "ai+static") {
+        codeCache[codeHash] = { score: r.score, flags: r.flags,
+          hash: ethers.keccak256(ethers.toUtf8Bytes(r.report || "{}")) };
+        saveCache();
+      }
       if (r.verified && r.engine !== "ai+static") {
         degraded++;
         log(`  !! AI LAYER DEGRADED on a verified contract: ${r.aiError || "unknown"}`);
@@ -137,7 +184,7 @@ async function cycle(provider, wallet, registry) {
     } catch (e) {
       log(`  scan failed ${c.address}: ${e.message}`);
     }
-    await sleep(1200); // be polite to the API + model
+    await sleep(1200); // only reached on a real API call
   }
   if (!rows.length) return log("no successful scans");
 
@@ -152,13 +199,15 @@ async function cycle(provider, wallet, registry) {
         b.map((x) => x.score),
         b.map((x) => x.flags),
         b.map((x) => x.hash),
-        2 // schemaVersion 2 = AI+static engine
+        4 // schemaVersion 4 = metadata-safe bytecode heuristics
       );
       log(`  attestBatch(${b.length}) sent ${tx.hash}`);
       await tx.wait();
       log(`  confirmed ${CFG.explorer}/tx/${tx.hash}`);
     } catch (e) {
       log(`  attestBatch failed: ${e.shortMessage || e.message}`);
+      try { registry.runner.reset(); } catch (_) {}   // resync nonce after a failure
+      await sleep(6000);
     }
     await sleep(2000);
   }
@@ -170,10 +219,27 @@ async function cycle(provider, wallet, registry) {
   }
   log(`cycle done — totalAttestations = ${total}${degraded ? " (DEGRADED)" : ""}`);
 
+  // coverage denominator: count verified contracts at most once a day
+  let verified = "";
+  try {
+    const now = Date.now();
+    let last = 0;
+    try { last = Number(fs.readFileSync(COVERAGE_FILE, "utf8").trim()) || 0; } catch (_) {}
+    if (now - last > 7 * 24 * 3600 * 1000) {          // weekly: the count is expensive
+      const c = await countVerified();
+      fs.writeFileSync(COVERAGE_FILE, String(now));
+      verified = c.complete ? String(c.total) : `>=${c.total}`;
+      const pct = ((Number(total) / c.total) * 100).toFixed(1);
+      log(c.complete
+        ? `coverage: ${total}/${c.total} verified contracts (${pct}%)`
+        : `coverage: ${total}/>=${c.total} verified contracts (<=${pct}% — count incomplete, treat as an upper bound)`);
+    }
+  } catch (e) { log("coverage count failed:", e.message); }
+
   // append KPI series for the growth chart
   try {
-    require("fs").appendFileSync(__dirname + "/kpi.csv",
-      `${new Date().toISOString()},${total},${rows.length},${degraded}\n`);
+    fs.appendFileSync(__dirname + "/kpi.csv",
+      `${new Date().toISOString()},${total},${rows.length},${degraded},${verified}\n`);
   } catch (e) { log("kpi write failed:", e.message); }
 }
 
@@ -181,7 +247,8 @@ async function main() {
   if (!CFG.key) { console.error("ATTESTER_KEY missing (see .env.example)"); process.exit(1); }
   const provider = new ethers.JsonRpcProvider(CFG.rpc);
   const wallet = new ethers.Wallet(CFG.key, provider);
-  const registry = new ethers.Contract(CFG.registry, ABI, wallet);
+  const signer = new ethers.NonceManager(wallet);   // local nonce tracking; the RPC's "pending" lags
+  const registry = new ethers.Contract(CFG.registry, ABI, signer);
 
   log("Aegis watcher starting");
   log("  attester :", wallet.address);

@@ -3,3 +3,14 @@
 node_modules/
 logs/
 *.log
+bytecode-cache.json
+.coverage-day
+.env*
+!.env.example
+*.bak
+*.bak-*
+bytecode-cache*.json
+corrections*.json
+*.progress.json
+held_for_review.json
+.coverage-day
