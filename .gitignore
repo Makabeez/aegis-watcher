@@ -14,3 +14,9 @@ corrections*.json
 *.progress.json
 held_for_review.json
 .coverage-day
+templates.json
+unknown-templates.json
+clone-scout.state.json
+template-reports/
+.ai-day.json
+!.env.mainnet.example

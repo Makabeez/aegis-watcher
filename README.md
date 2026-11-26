@@ -189,3 +189,7 @@ a failed batch waits 6s so an in-flight tx can settle. This fixes the
   attester within hours; the `MIN_BALANCE_ETH` guard then paused writes until it was topped up.
 - **Stale watch.** `stale-watch.sh` restarts the watcher and sends an alert if `kpi.csv` stops growing
   for 6 hours.
+
+## Mainnet branch: clone-scout
+
+The `mainnet` branch adds `clone-scout.js`, which scores **unverified** launchpad clones. It finds new tokens from their mint events, matches each one to a template Aegis has already scanned or hand-reviewed (`templates.js`: metadata stripped, PUSH32 operands masked, minimal proxies resolved), and writes the inherited verdict with schema 5. Unknown templates are counted and flagged at 10/50/200 clones. `learn-templates.js` seeds the template store from registry history or from a hand review. Setup is in `aegis-giwa/docs/MAINNET-RUNBOOK.md`.

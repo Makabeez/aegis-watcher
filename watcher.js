@@ -31,6 +31,7 @@ const CFG = {
   minBalance: process.env.MIN_BALANCE_ETH || "0.005",
   once:       process.env.RUN_ONCE === "1",
   dryRun:     process.env.DRY_RUN === "1",
+  maxAiPerDay: parseInt(process.env.MAX_AI_PER_DAY || "0", 10),       // 0 = no cap (Sepolia default)
 };
 
 const ABI = [
@@ -69,6 +70,26 @@ async function countVerified() {
 }
 
 const saveCache = () => { try { fs.writeFileSync(CACHE_FILE, JSON.stringify(codeCache)); } catch (_) {} };
+
+// template verdicts shared with clone-scout.js (see templates.js)
+const { templateKey, TemplateStore } = require("./templates");
+const templates = new TemplateStore(__dirname + "/templates.json");
+let CHAIN_ID = "?";   // set in main() from the RPC
+
+// daily cap on AI scans, so a flood of new deployments (mainnet launch day) can't run up the bill
+const AI_DAY_FILE = __dirname + "/.ai-day.json";
+const today = () => new Date().toISOString().slice(0, 10);
+function aiBudgetLeft() {
+  if (!CFG.maxAiPerDay) return true;
+  let d = {}; try { d = JSON.parse(fs.readFileSync(AI_DAY_FILE, "utf8")); } catch (_) {}
+  return d.day !== today() || (d.n || 0) < CFG.maxAiPerDay;
+}
+function aiUsed() {
+  let d = {}; try { d = JSON.parse(fs.readFileSync(AI_DAY_FILE, "utf8")); } catch (_) {}
+  if (d.day !== today()) d = { day: today(), n: 0 };
+  d.n++;
+  try { fs.writeFileSync(AI_DAY_FILE, JSON.stringify(d)); } catch (_) {}
+}
 
 const log = (...a) => console.log(new Date().toISOString(), ...a);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -162,7 +183,12 @@ async function cycle(provider, wallet, registry) {
         log(`  cached  ${c.address} ${c.name} -> ${cached.score}/100 flags=${cached.flags} [bytecode-match]`);
         continue;
       }
+      if (!aiBudgetLeft()) {
+        log(`  !! daily AI budget reached (MAX_AI_PER_DAY=${CFG.maxAiPerDay}) — ${c.address} waits for tomorrow`);
+        break;
+      }
       const r = await analyze(c.address);
+      aiUsed();
       rows.push({
         address: c.address,
         score: r.score,
@@ -176,6 +202,12 @@ async function cycle(provider, wallet, registry) {
         codeCache[codeHash] = { score: r.score, flags: r.flags,
           hash: ethers.keccak256(ethers.toUtf8Bytes(r.report || "{}")) };
         saveCache();
+        // teach clone-scout: unverified clones of this template inherit this verdict
+        try {
+          const t = await templateKey(provider, c.address, async (a) => (a.toLowerCase() === c.address.toLowerCase() ? code : provider.getCode(a)));
+          if (t) templates.learn(t.key, { score: r.score, flags: r.flags, reportHash: codeCache[codeHash].hash,
+                                          source: `scan:${CHAIN_ID}:${c.address}`, name: r.name || c.name });
+        } catch (_) {}
       }
       if (r.verified && r.engine !== "ai+static") {
         degraded++;
@@ -249,6 +281,7 @@ async function main() {
   const wallet = new ethers.Wallet(CFG.key, provider);
   const signer = new ethers.NonceManager(wallet);   // local nonce tracking; the RPC's "pending" lags
   const registry = new ethers.Contract(CFG.registry, ABI, signer);
+  CHAIN_ID = String((await provider.getNetwork()).chainId);
 
   log("Aegis watcher starting");
   log("  attester :", wallet.address);
